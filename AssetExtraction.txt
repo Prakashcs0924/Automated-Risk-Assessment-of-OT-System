@@ -1,0 +1,173 @@
+# ======================================
+# ✅ INSTALL PACKAGES
+# ======================================
+!pip install easyocr PyMuPDF opencv-python pillow tqdm pandas openpyxl -q
+
+# ======================================
+# ✅ IMPORTS
+# ======================================
+import os
+import fitz
+import cv2
+import numpy as np
+import easyocr
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+from google.colab import files
+from openpyxl.styles import Font, Alignment
+
+# ======================================
+# ✅ UPLOAD PDF
+# ======================================
+print("📂 Upload your PDF")
+uploaded = files.upload()
+pdf_path = list(uploaded.keys())[0]
+
+# ======================================
+# ✅ CONFIG
+# ======================================
+output_excel = "/content/output_levels.xlsx"
+debug_folder = "/content/debug_images"
+os.makedirs(debug_folder, exist_ok=True)
+
+reader = easyocr.Reader(['en'], gpu=False)
+results = []
+
+doc = fitz.open(pdf_path)
+
+# ======================================
+# ✅ LEVEL FUNCTION (FIXED)
+# ======================================
+def assign_level(y, lines):
+    if not lines:
+        return 1
+
+    lines = sorted(lines)
+
+    if y >= lines[-1]:
+        return 1
+
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i - 1] <= y and y < lines[i]:
+            return len(lines) - i + 1
+
+    return len(lines) + 1
+
+# ======================================
+# ✅ PROCESS PDF
+# ======================================
+for page_num in tqdm(range(len(doc)), desc="Processing Pages"):
+
+    pix = doc[page_num].get_pixmap(dpi=300)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    debug_img = img_cv.copy()
+    h, w = img_cv.shape[:2]
+
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+
+    # ---- RED BOX DETECTION ----
+    lower_red1 = np.array([0,100,100])
+    upper_red1 = np.array([10,255,255])
+    lower_red2 = np.array([160,100,100])
+    upper_red2 = np.array([179,255,255])
+
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) | \
+               cv2.inRange(hsv, lower_red2, upper_red2)
+
+    contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    red_boxes = [cv2.boundingRect(c) for c in contours_red if cv2.contourArea(c) > 100]
+
+    # ---- GREEN LINE DETECTION ----
+    lower_green = np.array([35,40,40])
+    upper_green = np.array([90,255,255])
+
+    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (w // 30, 3))
+    horiz = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+    horiz = cv2.dilate(horiz, kernel)
+
+    contours_green, _ = cv2.findContours(horiz, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    green_y_positions = []
+    for c in contours_green:
+        xg, yg, wg, hg = cv2.boundingRect(c)
+        if wg > w * 0.3 and hg < h * 0.05:
+            green_y_positions.append(yg + hg // 2)
+
+    # Merge lines
+    green_y_positions = sorted(set(green_y_positions))
+    merged = []
+    for y in green_y_positions:
+        if not merged or abs(y - merged[-1]) > 10:
+            merged.append(y)
+
+    green_y_positions = merged
+
+    # ---- OCR ----
+    for (x, y, wbox, hbox) in red_boxes:
+        roi = img_cv[y:y+hbox, x:x+wbox]
+        ocr_result = reader.readtext(roi)
+
+        if not ocr_result:
+            continue
+
+        text_content = " ".join([t[1] for t in ocr_result]).strip()
+        level_num = assign_level(y, green_y_positions)
+
+        results.append({
+            "Page": page_num + 1,
+            "Asset Name": text_content,
+            "Level": f"Level {level_num}"
+        })
+
+        # Debug box
+        cv2.rectangle(debug_img, (x, y), (x+wbox, y+hbox), (0,0,255), 2)
+
+    cv2.imwrite(f"{debug_folder}/page_{page_num+1}.png", debug_img)
+
+# ======================================
+# ✅ CREATE EXCEL (SAFE)
+# ======================================
+print("\n📊 Total extracted:", len(results))
+
+if len(results) == 0:
+    print("❌ No data extracted — Excel not created")
+else:
+    df = pd.DataFrame(results)
+    df = df.sort_values(by=["Page", "Level"]).reset_index(drop=True)
+
+    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name="Asset Report")
+
+        worksheet = writer.sheets["Asset Report"]
+
+        # ✅ Header style
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal='center')
+
+        # ✅ Widths
+        worksheet.column_dimensions['A'].width = 10
+        worksheet.column_dimensions['B'].width = 50
+        worksheet.column_dimensions['C'].width = 15
+
+        # ✅ Freeze
+        worksheet.freeze_panes = "A2"
+
+        # ✅ Filter
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+    print(f"✅ Excel saved at: {output_excel}")
+
+    if os.path.exists(output_excel):
+        files.download(output_excel)
+
+# ======================================
+# ✅ DOWNLOAD DEBUG IMAGES
+# ======================================
+!zip -r debug_images.zip /content/debug_images > /dev/null
+files.download("debug_images.zip")
